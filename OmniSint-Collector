@@ -1,0 +1,2180 @@
+use std::collections::{HashMap, HashSet};
+use std::error::Error;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use chrono::{DateTime, Utc};
+use clap::{App, Arg, SubCommand};
+use futures::stream::{self, StreamExt};
+use log::{debug, error, info, warn};
+use reqwest::{Client, ClientBuilder, Proxy};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use tokio::time::sleep;
+use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
+use trust_dns_resolver::Resolver;
+use url::Url;
+use whois_rust::{WhoIs, WhoIsLookupOptions};
+
+// Configuration structures
+#[derive(Debug, Deserialize, Clone)]
+struct Config {
+    api_keys: HashMap<String, String>,
+    proxy_settings: Option<ProxySettings>,
+    rate_limits: HashMap<String, RateLimit>,
+    modules: ModulesConfig,
+    output: OutputConfig,
+    user_agents: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct ProxySettings {
+    enabled: bool,
+    url: String,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct RateLimit {
+    requests_per_minute: u32,
+    burst: u32,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct ModulesConfig {
+    username_discovery: UsernameDiscoveryConfig,
+    dark_web: DarkWebConfig,
+    search_engine: SearchEngineConfig,
+    social_media: SocialMediaConfig,
+    document_metadata: DocumentMetadataConfig,
+    domain_intelligence: DomainIntelligenceConfig,
+    geospatial: GeospatialConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct UsernameDiscoveryConfig {
+    enabled: bool,
+    platforms: Vec<String>,
+    correlation_threshold: f32,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct DarkWebConfig {
+    enabled: bool,
+    sources: Vec<String>,
+    search_terms: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct SearchEngineConfig {
+    enabled: bool,
+    engines: Vec<String>,
+    dorks: Vec<String>,
+    max_results_per_dork: u32,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct SocialMediaConfig {
+    enabled: bool,
+    platforms: Vec<String>,
+    relationship_mapping: bool,
+    max_depth: u32,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct DocumentMetadataConfig {
+    enabled: bool,
+    file_types: Vec<String>,
+    extract_authors: bool,
+    extract_creation_dates: bool,
+    extract_software_info: bool,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct DomainIntelligenceConfig {
+    enabled: bool,
+    gather_dns: bool,
+    gather_whois: bool,
+    gather_ssl_certs: bool,
+    subdomain_enumeration: bool,
+    max_subdomains: u32,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct GeospatialConfig {
+    enabled: bool,
+    sources: Vec<String>,
+    visualization_enabled: bool,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct OutputConfig {
+    format: String,
+    directory: String,
+    report_template: String,
+    include_confidence_scores: bool,
+}
+
+// Result structures
+#[derive(Debug, Serialize, Clone)]
+struct IntelligenceReport {
+    metadata: ReportMetadata,
+    summary: ReportSummary,
+    username_results: Option<UsernameResults>,
+    dark_web_results: Option<DarkWebResults>,
+    search_engine_results: Option<SearchEngineResults>,
+    social_media_results: Option<SocialMediaResults>,
+    document_metadata_results: Option<DocumentMetadataResults>,
+    domain_intelligence_results: Option<DomainIntelligenceResults>,
+    geospatial_results: Option<GeospatialResults>,
+    relationships: Vec<Relationship>,
+    confidence_scores: HashMap<String, f32>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ReportMetadata {
+    target: String,
+    timestamp: DateTime<Utc>,
+    version: String,
+    execution_time: Duration,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ReportSummary {
+    total_findings: u32,
+    risk_score: f32,
+    key_findings: Vec<String>,
+    recommendations: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct UsernameResults {
+    platforms_checked: u32,
+    accounts_found: u32,
+    accounts: Vec<UserAccount>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct UserAccount {
+    platform: String,
+    username: String,
+    url: String,
+    account_data: HashMap<String, Value>,
+    last_activity: Option<DateTime<Utc>>,
+    creation_date: Option<DateTime<Utc>>,
+    confidence: f32,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct DarkWebResults {
+    sources_checked: u32,
+    leaks_found: u32,
+    credentials_found: u32,
+    leaks: Vec<DarkWebLeak>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct DarkWebLeak {
+    source: String,
+    date_discovered: DateTime<Utc>,
+    leak_type: String,
+    data_snippet: String,
+    hash: String,
+    confidence: f32,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct SearchEngineResults {
+    engines_used: Vec<String>,
+    dorks_used: Vec<String>,
+    total_results: u32,
+    findings: Vec<SearchResult>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct SearchResult {
+    engine: String,
+    dork: String,
+    url: String,
+    title: String,
+    snippet: String,
+    discovery_date: DateTime<Utc>,
+    confidence: f32,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct SocialMediaResults {
+    platforms_analyzed: Vec<String>,
+    profiles_found: u32,
+    posts_analyzed: u32,
+    profiles: Vec<SocialProfile>,
+    notable_posts: Vec<SocialPost>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct SocialProfile {
+    platform: String,
+    username: String,
+    display_name: String,
+    url: String,
+    bio: Option<String>,
+    location: Option<String>,
+    followers: Option<u32>,
+    following: Option<u32>,
+    join_date: Option<DateTime<Utc>>,
+    last_activity: Option<DateTime<Utc>>,
+    profile_image: Option<String>,
+    confidence: f32,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct SocialPost {
+    platform: String,
+    username: String,
+    post_id: String,
+    url: String,
+    content: String,
+    timestamp: DateTime<Utc>,
+    location: Option<String>,
+    engagement: HashMap<String, u32>,
+    sentiment: Option<f32>,
+    confidence: f32,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct DocumentMetadataResults {
+    documents_analyzed: u32,
+    file_types: Vec<String>,
+    documents: Vec<DocumentMetadata>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct DocumentMetadata {
+    filename: String,
+    url: String,
+    file_type: String,
+    size_bytes: u64,
+    creation_date: Option<DateTime<Utc>>,
+    modification_date: Option<DateTime<Utc>>,
+    author: Option<String>,
+    software: Option<String>,
+    version: Option<String>,
+    extracted_text: Option<String>,
+    confidence: f32,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct DomainIntelligenceResults {
+    domains_analyzed: Vec<String>,
+    subdomains_found: u32,
+    domains: Vec<DomainIntelligence>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct DomainIntelligence {
+    domain: String,
+    registrar: Option<String>,
+    creation_date: Option<DateTime<Utc>>,
+    expiration_date: Option<DateTime<Utc>>,
+    name_servers: Vec<String>,
+    ip_addresses: Vec<String>,
+    ssl_info: Option<SSLCertInfo>,
+    subdomains: Vec<String>,
+    whois_data: Option<String>,
+    confidence: f32,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct SSLCertInfo {
+    subject: String,
+    issuer: String,
+    valid_from: DateTime<Utc>,
+    valid_to: DateTime<Utc>,
+    serial_number: String,
+    fingerprint: String,
+    alternative_names: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct GeospatialResults {
+    locations_found: u32,
+    locations: Vec<GeoLocation>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct GeoLocation {
+    source: String,
+    location_type: String,
+    latitude: f64,
+    longitude: f64,
+    address: Option<String>,
+    city: Option<String>,
+    country: Option<String>,
+    timestamp: Option<DateTime<Utc>>,
+    accuracy_meters: Option<f32>,
+    confidence: f32,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct Relationship {
+    source_type: String,
+    source_id: String,
+    relationship_type: String,
+    target_type: String,
+    target_id: String,
+    confidence: f32,
+    metadata: HashMap<String, Value>,
+}
+
+// Rate limiter implementation
+struct RateLimiter {
+    last_request: Instant,
+    requests_per_minute: u32,
+    burst: u32,
+    request_count: u32,
+}
+
+impl RateLimiter {
+    fn new(requests_per_minute: u32, burst: u32) -> Self {
+        RateLimiter {
+            last_request: Instant::now(),
+            requests_per_minute,
+            burst,
+            request_count: 0,
+        }
+    }
+
+    async fn acquire(&mut self) {
+        let elapsed = self.last_request.elapsed();
+        let min_interval = Duration::from_secs(60) / self.requests_per_minute as u32;
+        
+        if elapsed < min_interval && self.request_count >= self.burst {
+            let sleep_time = min_interval - elapsed;
+            sleep(sleep_time).await;
+        }
+        
+        if elapsed >= Duration::from_secs(60) {
+            self.request_count = 0;
+        }
+        
+        self.last_request = Instant::now();
+        self.request_count += 1;
+    }
+}
+
+// Main OSINT collector implementation
+struct OmniSINTCollector {
+    config: Config,
+    client: Client,
+    rate_limiters: HashMap<String, Mutex<RateLimiter>>,
+    resolver: Resolver,
+    whois_client: WhoIs,
+}
+
+impl OmniSINTCollector {
+    async fn new(config_path: &str) -> Result<Self, Box<dyn Error>> {
+        // Load configuration
+        let config_content = fs::read_to_string(config_path)?;
+        let config: Config = serde_json::from_str(&config_content)?;
+        
+        // Setup HTTP client with proxy if configured
+        let mut client_builder = ClientBuilder::new()
+            .timeout(Duration::from_secs(30))
+            .user_agent(Self::get_random_user_agent(&config.user_agents));
+            
+        if let Some(proxy_settings) = &config.proxy_settings {
+            if proxy_settings.enabled {
+                let mut proxy = Proxy::all(&proxy_settings.url)?;
+                if let (Some(username), Some(password)) = (&proxy_settings.username, &proxy_settings.password) {
+                    proxy = proxy.basic_auth(username, password);
+                }
+                client_builder = client_builder.proxy(proxy);
+            }
+        }
+        
+        let client = client_builder.build()?;
+        
+        // Initialize rate limiters
+        let mut rate_limiters = HashMap::new();
+        for (service, limit) in &config.rate_limits {
+            rate_limiters.insert(
+                service.clone(),
+                Mutex::new(RateLimiter::new(limit.requests_per_minute, limit.burst)),
+            );
+        }
+        
+        // Initialize DNS resolver
+        let resolver = Resolver::new(ResolverConfig::default(), ResolverOpts::default())?;
+        
+        // Initialize WHOIS client
+        let whois_client = WhoIs::from_string("whois-servers.json")?;
+        
+        Ok(OmniSINTCollector {
+            config,
+            client,
+            rate_limiters,
+            resolver,
+            whois_client,
+        })
+    }
+    
+    fn get_random_user_agent(user_agents: &[String]) -> &str {
+        use rand::seq::SliceRandom;
+        let mut rng = rand::thread_rng();
+        user_agents.choose(&mut rng).map(|s| s.as_str()).unwrap_or("OmniSINT Collector/1.0")
+    }
+    
+    async fn collect_intelligence(&self, target: &str, target_type: &str) -> Result<IntelligenceReport, Box<dyn Error>> {
+        let start_time = Instant::now();
+        info!("Starting intelligence collection for target: {}", target);
+        
+        // Initialize report structure
+        let mut report = IntelligenceReport {
+            metadata: ReportMetadata {
+                target: target.to_string(),
+                timestamp: Utc::now(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                execution_time: Duration::from_secs(0),
+            },
+            summary: ReportSummary {
+                total_findings: 0,
+                risk_score: 0.0,
+                key_findings: Vec::new(),
+                recommendations: Vec::new(),
+            },
+            username_results: None,
+            dark_web_results: None,
+            search_engine_results: None,
+            social_media_results: None,
+            document_metadata_results: None,
+            domain_intelligence_results: None,
+            geospatial_results: None,
+            relationships: Vec::new(),
+            confidence_scores: HashMap::new(),
+        };
+        
+        // Execute modules based on target type and configuration
+        match target_type {
+            "username" => {
+                if self.config.modules.username_discovery.enabled {
+                    report.username_results = Some(self.collect_username_intelligence(target).await?);
+                }
+                if self.config.modules.social_media.enabled {
+                    report.social_media_results = Some(self.collect_social_media_intelligence(target).await?);
+                }
+                if self.config.modules.dark_web.enabled {
+                    report.dark_web_results = Some(self.collect_dark_web_intelligence(target).await?);
+                }
+            },
+            "domain" => {
+                if self.config.modules.domain_intelligence.enabled {
+                    report.domain_intelligence_results = Some(self.collect_domain_intelligence(target).await?);
+                }
+                if self.config.modules.search_engine.enabled {
+                    report.search_engine_results = Some(self.collect_search_engine_intelligence(target).await?);
+                }
+                if self.config.modules.document_metadata.enabled {
+                    report.document_metadata_results = Some(self.collect_document_metadata(target).await?);
+                }
+            },
+            "email" => {
+                if self.config.modules.dark_web.enabled {
+                    report.dark_web_results = Some(self.collect_dark_web_intelligence(target).await?);
+                }
+                if self.config.modules.search_engine.enabled {
+                    report.search_engine_results = Some(self.collect_search_engine_intelligence(target).await?);
+                }
+                // Extract username from email for additional searches
+                if let Some(username) = target.split('@').next() {
+                    if self.config.modules.username_discovery.enabled {
+                        report.username_results = Some(self.collect_username_intelligence(username).await?);
+                    }
+                }
+            },
+            _ => {
+                warn!("Unsupported target type: {}", target_type);
+                return Err("Unsupported target type".into());
+            }
+        }
+        
+        // Add geospatial data if enabled
+        if self.config.modules.geospatial.enabled {
+            report.geospatial_results = Some(self.collect_geospatial_intelligence(target).await?);
+        }
+        
+        // Find relationships between collected data
+        self.analyze_relationships(&mut report).await?;
+        
+        // Calculate confidence scores
+        self.calculate_confidence_scores(&mut report).await?;
+        
+        // Generate summary and recommendations
+        self.generate_summary(&mut report).await?;
+        
+        // Set execution time
+        report.metadata.execution_time = start_time.elapsed();
+        
+        info!("Intelligence collection completed in {:?}", report.metadata.execution_time);
+        Ok(report)
+    }
+    
+    async fn collect_username_intelligence(&self, username: &str) -> Result<UsernameResults, Box<dyn Error>> {
+        info!("Collecting username intelligence for: {}", username);
+        
+        let mut results = UsernameResults {
+            platforms_checked: 0,
+            accounts_found: 0,
+            accounts: Vec::new(),
+        };
+        
+        let platforms = &self.config.modules.username_discovery.platforms;
+        results.platforms_checked = platforms.len() as u32;
+        
+        // Process platforms in parallel with rate limiting
+        let mut handles = Vec::new();
+        
+        for platform in platforms {
+            let username = username.to_string();
+            let platform_name = platform.clone();
+            let client = self.client.clone();
+            let rate_limiter = self.rate_limiters.get("username_discovery").cloned();
+            
+            handles.push(tokio::spawn(async move {
+                if let Some(rate_limiter) = rate_limiter {
+                    rate_limiter.lock().unwrap().acquire().await;
+                }
+                
+                match Self::check_username_on_platform(&client, &username, &platform_name).await {
+                    Ok(Some(account)) => Some(account),
+                    Ok(None) => None,
+                    Err(e) => {
+                        error!("Error checking username on {}: {}", platform_name, e);
+                        None
+                    }
+                }
+            }));
+        }
+        
+        for handle in futures::future::join_all(handles).await {
+            if let Ok(Some(account)) = handle {
+                results.accounts.push(account);
+                results.accounts_found += 1;
+            }
+        }
+        
+        info!("Found {} accounts across {} platforms for username: {}", 
+              results.accounts_found, results.platforms_checked, username);
+        
+        Ok(results)
+    }
+    
+    async fn check_username_on_platform(client: &Client, username: &str, platform: &str) -> Result<Option<UserAccount>, Box<dyn Error>> {
+        // Platform-specific URL patterns and checks
+        let (url, exists_check) = match platform.to_lowercase().as_str() {
+            "twitter" => (
+                format!("https://twitter.com/{}", username),
+                |body: &str| !body.contains("This account doesn't exist")
+            ),
+            "github" => (
+                format!("https://github.com/{}", username),
+                |body: &str| !body.contains("Not Found") && !body.contains("404")
+            ),
+            "instagram" => (
+                format!("https://www.instagram.com/{}/", username),
+                |body: &str| !body.contains("Page Not Found")
+            ),
+            "facebook" => (
+                format!("https://www.facebook.com/{}", username),
+                |body: &str| !body.contains("isn't available") && !body.contains("Page Not Found")
+            ),
+            "linkedin" => (
+                format!("https://www.linkedin.com/in/{}", username),
+                |body: &str| !body.contains("Page not found") && !body.contains("404")
+            ),
+            "reddit" => (
+                format!("https://www.reddit.com/user/{}", username),
+                |body: &str| !body.contains("Sorry, nobody on Reddit goes by that name")
+            ),
+            "tiktok" => (
+                format!("https://www.tiktok.com/@{}", username),
+                |body: &str| !body.contains("Couldn't find this account")
+            ),
+            "pinterest" => (
+                format!("https://www.pinterest.com/{}/", username),
+                |body: &str| !body.contains("404") && !body.contains("Not Found")
+            ),
+            "youtube" => (
+                format!("https://www.youtube.com/user/{}", username),
+                |body: &str| !body.contains("404") && !body.contains("This page isn't available")
+            ),
+            "soundcloud" => (
+                format!("https://soundcloud.com/{}", username),
+                |body: &str| !body.contains("404") && !body.contains("We can't find that user")
+            ),
+            _ => {
+                debug!("Unsupported platform: {}", platform);
+                return Ok(None);
+            }
+        };
+        
+        // Make the request
+        let response = client.get(&url).send().await?;
+        let status = response.status();
+        let body = response.text().await?;
+        
+        // Check if the account exists
+        if status.is_success() && exists_check(&body) {
+            // Extract additional data based on platform
+            let mut account_data = HashMap::new();
+            
+            // Basic extraction - would be more sophisticated in a real implementation
+            if platform == "twitter" {
+                if let Some(bio_start) = body.find("\"description\":\"") {
+                    if let Some(bio_end) = body[bio_start + 14..].find("\"") {
+                        account_data.insert("bio".to_string(), json!(body[bio_start + 14..bio_start + 14 + bio_end]));
+                    }
+                }
+            }
+            
+            // Create and return the account
+            let account = UserAccount {
+                platform: platform.to_string(),
+                username: username.to_string(),
+                url: url.clone(),
+                account_data,
+                last_activity: None, // Would require additional API calls
+                creation_date: None, // Would require additional API calls
+                confidence: 0.85, // Base confidence score
+            };
+            
+            return Ok(Some(account));
+        }
+        
+        Ok(None)
+    }
+    
+    async fn collect_dark_web_intelligence(&self, target: &str) -> Result<DarkWebResults, Box<dyn Error>> {
+        info!("Collecting dark web intelligence for: {}", target);
+        
+        // This would typically integrate with dark web monitoring services
+        // For demonstration, we'll simulate some findings
+        
+        let mut results = DarkWebResults {
+            sources_checked: self.config.modules.dark_web.sources.len() as u32,
+            leaks_found: 0,
+            credentials_found: 0,
+            leaks: Vec::new(),
+        };
+        
+        // Simulate some leaked data findings
+        // In a real implementation, this would query actual dark web sources
+        
+        // Example leak 1: Email in data breach
+        if target.contains('@') {
+            results.leaks.push(DarkWebLeak {
+                source: "SimulatedBreachDB".to_string(),
+                date_discovered: Utc::now() - chrono::Duration::days(30),
+                leak_type: "Credentials".to_string(),
+                data_snippet: format!("Email: {}, Password: [REDACTED]", target),
+                hash: format!("{:x}", md5::compute(format!("simulated-{}", target))),
+                confidence: 0.75,
+            });
+            
+            results.leaks_found += 1;
+            results.credentials_found += 1;
+        }
+        
+        // Example leak 2: Username in forum database
+        if !target.contains('@') {
+            results.leaks.push(DarkWebLeak {
+                source: "HackerForumDump".to_string(),
+                date_discovered: Utc::now() - chrono::Duration::days(120),
+                leak_type: "Forum Data".to_string(),
+                data_snippet: format!("Username: {}, Registration IP: 192.0.2.X", target),
+                hash: format!("{:x}", md5::compute(format!("forum-{}", target))),
+                confidence: 0.65,
+            });
+            
+            results.leaks_found += 1;
+        }
+        
+        info!("Found {} leaks with {} credential exposures for target: {}", 
+              results.leaks_found, results.credentials_found, target);
+        
+        Ok(results)
+    }
+    
+    async fn collect_search_engine_intelligence(&self, target: &str) -> Result<SearchEngineResults, Box<dyn Error>> {
+        info!("Collecting search engine intelligence for: {}", target);
+        
+        let mut results = SearchEngineResults {
+            engines_used: self.config.modules.search_engine.engines.clone(),
+            dorks_used: self.config.modules.search_engine.dorks.clone(),
+            total_results: 0,
+            findings: Vec::new(),
+        };
+        
+        // Process each search engine and dork combination
+        for engine in &results.engines_used {
+            for dork in &results.dorks_used {
+                // Apply rate limiting
+                if let Some(rate_limiter) = self.rate_limiters.get("search_engine") {
+                    rate_limiter.lock().unwrap().acquire().await;
+                }
+                
+                // Format the search query with the target
+                let formatted_dork = dork.replace("{target}", target);
+                
+                // Perform the search based on the engine
+                match engine.as_str() {
+                    "google" => {
+                        self.search_google(&formatted_dork, engine, dork, &mut results).await?;
+                    },
+                    "bing" => {
+                        self.search_bing(&formatted_dork, engine, dork, &mut results).await?;
+                    },
+                    "duckduckgo" => {
+                        self.search_duckduckgo(&formatted_dork, engine, dork, &mut results).await?;
+                    },
+                    _ => {
+                        warn!("Unsupported search engine: {}", engine);
+                    }
+                }
+            }
+        }
+        
+        info!("Found {} search results across {} engines for target: {}", 
+              results.total_results, results.engines_used.len(), target);
+        
+        Ok(results)
+    }
+    
+    async fn search_google(&self, query: &str, engine: &str, dork: &str, results: &mut SearchEngineResults) -> Result<(), Box<dyn Error>> {
+        // In a real implementation, this would use Google's API or scrape results
+        // For demonstration, we'll simulate some findings
+        
+        // Simulate 2-3 search results
+        let result_count = 2 + (query.len() % 2); // Deterministic but variable
+        
+        for i in 0..result_count {
+            let result = SearchResult {
+                engine: engine.to_string(),
+                dork: dork.to_string(),
+                url: format!("https://example.com/result-{}-{}", i, query.len() % 100),
+                title: format!("Example Result {} for {}", i, query),
+                snippet: format!("This is a simulated search result for the query '{}'. It contains relevant information about the target.", query),
+                discovery_date: Utc::now(),
+                confidence: 0.7 + (i as f32 * 0.05), // Vary confidence slightly
+            };
+            
+            results.findings.push(result);
+            results.total_results += 1;
+        }
+        
+        Ok(())
+    }
+    
+    async fn search_bing(&self, query: &str, engine: &str, dork: &str, results: &mut SearchEngineResults) -> Result<(), Box<dyn Error>> {
+        // Similar to Google search but with different result patterns
+        // Simulate 1-2 search results
+        let result_count = 1 + (query.len() % 2);
+        
+        for i in 0..result_count {
+            let result = SearchResult {
+                engine: engine.to_string(),
+                dork: dork.to_string(),
+                url: format!("https://example.org/page-{}-{}", i, query.len() % 50),
+                title: format!("Bing Result {} for {}", i, query),
+                snippet: format!("Different search engine, different results. This snippet contains information related to '{}'.", query),
+                discovery_date: Utc::now(),
+                confidence: 0.65 + (i as f32 * 0.05),
+            };
+            
+            results.findings.push(result);
+            results.total_results += 1;
+        }
+        
+        Ok(())
+    }
+    
+    async fn search_duckduckgo(&self, query: &str, engine: &str, dork: &str, results: &mut SearchEngineResults) -> Result<(), Box<dyn Error>> {
+        // Another search engine implementation
+        // Simulate 1-3 search results
+        let result_count = 1 + (query.len() % 3);
+        
+        for i in 0..result_count {
+            let result = SearchResult {
+                engine: engine.to_string(),
+                dork: dork.to_string(),
+                url: format!("https://example.net/content-{}-{}", i, query.len() % 75),
+                title: format!("DuckDuckGo Finding {} for {}", i, query),
+                snippet: format!("Privacy-focused search results for '{}'. Contains potentially relevant information.", query),
+                discovery_date: Utc::now(),
+                confidence: 0.6 + (i as f32 * 0.05),
+            };
+            
+            results.findings.push(result);
+            results.total_results += 1;
+        }
+        
+        Ok(())
+    }
+    
+    async fn collect_social_media_intelligence(&self, username: &str) -> Result<SocialMediaResults, Box<dyn Error>> {
+        info!("Collecting social media intelligence for: {}", username);
+        
+        let mut results = SocialMediaResults {
+            platforms_analyzed: self.config.modules.social_media.platforms.clone(),
+            profiles_found: 0,
+            posts_analyzed: 0,
+            profiles: Vec::new(),
+            notable_posts: Vec::new(),
+        };
+        
+        // Process platforms in parallel with rate limiting
+        let mut profile_handles = Vec::new();
+        
+        for platform in &results.platforms_analyzed {
+            let username = username.to_string();
+            let platform_name = platform.clone();
+            let client = self.client.clone();
+            let rate_limiter = self.rate_limiters.get("social_media").cloned();
+            
+            profile_handles.push(tokio::spawn(async move {
+                if let Some(rate_limiter) = rate_limiter {
+                    rate_limiter.lock
+continue from here:                     rate_limiter.lock
+
+Highlight
+rust
+
+Hide
+                    rate_limiter.lock().unwrap().acquire().await;
+                }
+                
+                match Self::get_social_profile(&client, &username, &platform_name).await {
+                    Ok(Some(profile)) => Some(profile),
+                    Ok(None) => None,
+                    Err(e) => {
+                        error!("Error getting social profile on {}: {}", platform_name, e);
+                        None
+                    }
+                }
+            }));
+        }
+        
+        for handle in futures::future::join_all(profile_handles).await {
+            if let Ok(Some(profile)) = handle {
+                // For profiles we found, also collect recent posts
+                let platform = profile.platform.clone();
+                let username = profile.username.clone();
+                let client = self.client.clone();
+                let rate_limiter = self.rate_limiters.get("social_media").cloned();
+                
+                results.profiles.push(profile);
+                results.profiles_found += 1;
+                
+                // Spawn another task to get posts for this profile
+                tokio::spawn(async move {
+                    if let Some(rate_limiter) = rate_limiter {
+                        rate_limiter.lock().unwrap().acquire().await;
+                    }
+                    
+                    match Self::get_social_posts(&client, &username, &platform).await {
+                        Ok(posts) => Some(posts),
+                        Err(e) => {
+                            error!("Error getting posts for {} on {}: {}", username, platform, e);
+                            None
+                        }
+                    }
+                });
+            }
+        }
+        
+        // Collect posts from all profiles
+        let mut post_handles = Vec::new();
+        
+        for profile in &results.profiles {
+            let username = profile.username.clone();
+            let platform = profile.platform.clone();
+            let client = self.client.clone();
+            let rate_limiter = self.rate_limiters.get("social_media").cloned();
+            
+            post_handles.push(tokio::spawn(async move {
+                if let Some(rate_limiter) = rate_limiter {
+                    rate_limiter.lock().unwrap().acquire().await;
+                }
+                
+                match Self::get_social_posts(&client, &username, &platform).await {
+                    Ok(posts) => posts,
+                    Err(e) => {
+                        error!("Error getting posts for {} on {}: {}", username, platform, e);
+                        Vec::new()
+                    }
+                }
+            }));
+        }
+        
+        for handle in futures::future::join_all(post_handles).await {
+            if let Ok(posts) = handle {
+                results.posts_analyzed += posts.len() as u32;
+                
+                // Add notable posts to the results
+                for post in posts {
+                    // Filter for notable posts (high engagement, relevant content, etc.)
+                    if Self::is_notable_post(&post) {
+                        results.notable_posts.push(post);
+                    }
+                }
+            }
+        }
+        
+        info!("Found {} profiles and analyzed {} posts for username: {}", 
+              results.profiles_found, results.posts_analyzed, username);
+        
+        Ok(results)
+    }
+    
+    async fn get_social_profile(client: &Client, username: &str, platform: &str) -> Result<Option<SocialProfile>, Box<dyn Error>> {
+        // In a real implementation, this would use platform APIs or scraping
+        // For demonstration, we'll simulate profile data
+        
+        // Check if profile exists (similar to username check but more detailed)
+        let (url, exists_check) = match platform.to_lowercase().as_str() {
+            "twitter" => (
+                format!("https://twitter.com/{}", username),
+                |body: &str| !body.contains("This account doesn't exist")
+            ),
+            "instagram" => (
+                format!("https://www.instagram.com/{}/", username),
+                |body: &str| !body.contains("Page Not Found")
+            ),
+            "facebook" => (
+                format!("https://www.facebook.com/{}", username),
+                |body: &str| !body.contains("isn't available") && !body.contains("Page Not Found")
+            ),
+            "reddit" => (
+                format!("https://www.reddit.com/user/{}", username),
+                |body: &str| !body.contains("Sorry, nobody on Reddit goes by that name")
+            ),
+            _ => {
+                debug!("Unsupported platform for detailed profile: {}", platform);
+                return Ok(None);
+            }
+        };
+        
+        // Simulate a request and response
+        // In a real implementation, this would be an actual HTTP request
+        
+        // Generate simulated profile data
+        if platform == "twitter" {
+            let profile = SocialProfile {
+                platform: platform.to_string(),
+                username: username.to_string(),
+                display_name: format!("{} User", username),
+                url: url.clone(),
+                bio: Some(format!("This is a simulated bio for {} on {}", username, platform)),
+                location: Some("New York, USA".to_string()),
+                followers: Some(1000 + (username.len() * 10)),
+                following: Some(500 + (username.len() * 5)),
+                join_date: Some(Utc::now() - chrono::Duration::days(365 * 2)),
+                last_activity: Some(Utc::now() - chrono::Duration::days(3)),
+                profile_image: Some(format!("https://example.com/{}_profile.jpg", username)),
+                confidence: 0.8,
+            };
+            
+            return Ok(Some(profile));
+        }
+        else if platform == "instagram" {
+            let profile = SocialProfile {
+                platform: platform.to_string(),
+                username: username.to_string(),
+                display_name: format!("{}", username),
+                url: url.clone(),
+                bio: Some(format!("📸 Photography | Travel | Food")),
+                location: Some("Los Angeles, CA".to_string()),
+                followers: Some(2500 + (username.len() * 15)),
+                following: Some(750 + (username.len() * 3)),
+                join_date: Some(Utc::now() - chrono::Duration::days(365 * 3)),
+                last_activity: Some(Utc::now() - chrono::Duration::days(1)),
+                profile_image: Some(format!("https://example.com/{}_insta.jpg", username)),
+                confidence: 0.85,
+            };
+            
+            return Ok(Some(profile));
+        }
+        
+        // Default for other platforms
+        let profile = SocialProfile {
+            platform: platform.to_string(),
+            username: username.to_string(),
+            display_name: username.to_string(),
+            url: url.clone(),
+            bio: None,
+            location: None,
+            followers: None,
+            following: None,
+            join_date: None,
+            last_activity: None,
+            profile_image: None,
+            confidence: 0.7,
+        };
+        
+        Ok(Some(profile))
+    }
+    
+    async fn get_social_posts(client: &Client, username: &str, platform: &str) -> Result<Vec<SocialPost>, Box<dyn Error>> {
+        // In a real implementation, this would use platform APIs or scraping
+        // For demonstration, we'll simulate post data
+        
+        let mut posts = Vec::new();
+        
+        // Generate 1-5 simulated posts
+        let post_count = 1 + (username.len() % 5);
+        
+        for i in 0..post_count {
+            let mut engagement = HashMap::new();
+            engagement.insert("likes".to_string(), 10 + i * 5);
+            engagement.insert("comments".to_string(), 2 + i);
+            
+            let days_ago = i as i64 + 1;
+            
+            let post = SocialPost {
+                platform: platform.to_string(),
+                username: username.to_string(),
+                post_id: format!("post_{}_{}_{}", platform, username, i),
+                url: format!("https://{}.com/{}/status/{}", platform, username, 1000000 + i),
+                content: format!("This is simulated post #{} by {} on {}. Contains some relevant content for analysis.", 
+                                i, username, platform),
+                timestamp: Utc::now() - chrono::Duration::days(days_ago),
+                location: if i % 3 == 0 { Some("New York, NY".to_string()) } else { None },
+                engagement,
+                sentiment: Some(0.2 + (i as f32 * 0.1)), // 0 to 1 scale, higher is more positive
+                confidence: 0.75,
+            };
+            
+            posts.push(post);
+        }
+        
+        Ok(posts)
+    }
+    
+    fn is_notable_post(post: &SocialPost) -> bool {
+        // Determine if a post is notable based on engagement, content, etc.
+        let has_high_engagement = post.engagement.get("likes").unwrap_or(&0) > &50 || 
+                                post.engagement.get("comments").unwrap_or(&0) > &10;
+                                
+        let is_recent = match post.timestamp {
+            dt if dt > (Utc::now() - chrono::Duration::days(30)) => true,
+            _ => false
+        };
+        
+        let has_interesting_content = post.content.contains("security") || 
+                                    post.content.contains("hack") || 
+                                    post.content.contains("password") ||
+                                    post.content.contains("private") ||
+                                    post.content.contains("secret");
+                                    
+        has_high_engagement || (is_recent && has_interesting_content)
+    }
+    
+    async fn collect_document_metadata(&self, domain: &str) -> Result<DocumentMetadataResults, Box<dyn Error>> {
+        info!("Collecting document metadata for domain: {}", domain);
+        
+        let mut results = DocumentMetadataResults {
+            documents_analyzed: 0,
+            file_types: self.config.modules.document_metadata.file_types.clone(),
+            documents: Vec::new(),
+        };
+        
+        // In a real implementation, this would:
+        // 1. Find documents on the domain through search engines
+        // 2. Download and analyze document metadata
+        
+        // For each file type, search for documents
+        for file_type in &results.file_types {
+            // Apply rate limiting
+            if let Some(rate_limiter) = self.rate_limiters.get("document_metadata") {
+                rate_limiter.lock().unwrap().acquire().await;
+            }
+            
+            // Search for documents of this type
+            let dork = format!("site:{} filetype:{}", domain, file_type);
+            
+            // Simulate finding 1-2 documents per file type
+            let doc_count = 1 + (domain.len() % 2);
+            
+            for i in 0..doc_count {
+                let filename = format!("document_{}.{}", i, file_type);
+                
+                let document = DocumentMetadata {
+                    filename: filename.clone(),
+                    url: format!("https://{}/documents/{}", domain, filename),
+                    file_type: file_type.clone(),
+                    size_bytes: 10000 + (i * 5000) as u64,
+                    creation_date: Some(Utc::now() - chrono::Duration::days(30 + i as i64 * 10)),
+                    modification_date: Some(Utc::now() - chrono::Duration::days(5 + i as i64)),
+                    author: Some(format!("J. Smith")),
+                    software: Some(format!("Microsoft Office")),
+                    version: Some(format!("2019")),
+                    extracted_text: Some(format!("Sample text extracted from document. Contains company information for {}.", domain)),
+                    confidence: 0.7,
+                };
+                
+                results.documents.push(document);
+                results.documents_analyzed += 1;
+            }
+        }
+        
+        info!("Analyzed {} documents across {} file types for domain: {}", 
+              results.documents_analyzed, results.file_types.len(), domain);
+        
+        Ok(results)
+    }
+    
+    async fn collect_domain_intelligence(&self, domain: &str) -> Result<DomainIntelligenceResults, Box<dyn Error>> {
+        info!("Collecting domain intelligence for: {}", domain);
+        
+        let mut results = DomainIntelligenceResults {
+            domains_analyzed: vec![domain.to_string()],
+            subdomains_found: 0,
+            domains: Vec::new(),
+        };
+        
+        // Main domain analysis
+        let mut domain_intel = DomainIntelligence {
+            domain: domain.to_string(),
+            registrar: None,
+            creation_date: None,
+            expiration_date: None,
+            name_servers: Vec::new(),
+            ip_addresses: Vec::new(),
+            ssl_info: None,
+            subdomains: Vec::new(),
+            whois_data: None,
+            confidence: 0.9,
+        };
+        
+        // Collect WHOIS data if enabled
+        if self.config.modules.domain_intelligence.gather_whois {
+            if let Some(rate_limiter) = self.rate_limiters.get("domain_whois") {
+                rate_limiter.lock().unwrap().acquire().await;
+            }
+            
+            match self.gather_whois_data(domain).await {
+                Ok((registrar, creation, expiration, nameservers, whois_text)) => {
+                    domain_intel.registrar = registrar;
+                    domain_intel.creation_date = creation;
+                    domain_intel.expiration_date = expiration;
+                    domain_intel.name_servers = nameservers;
+                    domain_intel.whois_data = whois_text;
+                },
+                Err(e) => {
+                    warn!("Error gathering WHOIS data for {}: {}", domain, e);
+                }
+            }
+        }
+        
+        // Collect DNS data if enabled
+        if self.config.modules.domain_intelligence.gather_dns {
+            if let Some(rate_limiter) = self.rate_limiters.get("domain_dns") {
+                rate_limiter.lock().unwrap().acquire().await;
+            }
+            
+            match self.gather_dns_data(domain).await {
+                Ok(ip_addresses) => {
+                    domain_intel.ip_addresses = ip_addresses;
+                },
+                Err(e) => {
+                    warn!("Error gathering DNS data for {}: {}", domain, e);
+                }
+            }
+        }
+        
+        // Collect SSL certificate data if enabled
+        if self.config.modules.domain_intelligence.gather_ssl_certs {
+            if let Some(rate_limiter) = self.rate_limiters.get("domain_ssl") {
+                rate_limiter.lock().unwrap().acquire().await;
+            }
+            
+            match self.gather_ssl_data(domain).await {
+                Ok(ssl_info) => {
+                    domain_intel.ssl_info = ssl_info;
+                },
+                Err(e) => {
+                    warn!("Error gathering SSL data for {}: {}", domain, e);
+                }
+            }
+        }
+        
+        // Collect subdomain data if enabled
+        if self.config.modules.domain_intelligence.subdomain_enumeration {
+            if let Some(rate_limiter) = self.rate_limiters.get("domain_subdomains") {
+                rate_limiter.lock().unwrap().acquire().await;
+            }
+            
+            match self.enumerate_subdomains(domain).await {
+                Ok(subdomains) => {
+                    domain_intel.subdomains = subdomains;
+                    results.subdomains_found = domain_intel.subdomains.len() as u32;
+                },
+                Err(e) => {
+                    warn!("Error enumerating subdomains for {}: {}", domain, e);
+                }
+            }
+        }
+        
+        results.domains.push(domain_intel);
+        
+        info!("Analyzed domain {} and found {} subdomains", domain, results.subdomains_found);
+        
+        Ok(results)
+    }
+    
+    async fn gather_whois_data(&self, domain: &str) -> Result<(Option<String>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Vec<String>, Option<String>), Box<dyn Error>> {
+        // In a real implementation, this would use the WHOIS protocol
+        // For demonstration, we'll simulate WHOIS data
+        
+        // Simulate WHOIS lookup
+        let whois_text = format!(
+            "Domain Name: {}\nRegistrar: Example Registrar, Inc.\nCreation Date: 2018-05-15T16:00:00Z\nExpiration Date: 2025-05-15T16:00:00Z\nName Servers: NS1.EXAMPLE.COM, NS2.EXAMPLE.COM",
+            domain.to_uppercase()
+        );
+        
+        let registrar = Some("Example Registrar, Inc.".to_string());
+        let creation_date = Some(Utc.ymd(2018, 5, 15).and_hms(16, 0, 0));
+        let expiration_date = Some(Utc.ymd(2025, 5, 15).and_hms(16, 0, 0));
+        let name_servers = vec!["NS1.EXAMPLE.COM".to_string(), "NS2.EXAMPLE.COM".to_string()];
+        
+        Ok((registrar, creation_date, expiration_date, name_servers, Some(whois_text)))
+    }
+    
+    async fn gather_dns_data(&self, domain: &str) -> Result<Vec<String>, Box<dyn Error>> {
+        // In a real implementation, this would use DNS resolution
+        // For demonstration, we'll simulate DNS data
+        
+        // Simulate A record lookup
+        let ip_addresses = vec!["93.184.216.34".to_string(), "2606:2800:220:1:248:1893:25c8:1946".to_string()];
+        
+        Ok(ip_addresses)
+    }
+    
+    async fn gather_ssl_data(&self, domain: &str) -> Result<Option<SSLCertInfo>, Box<dyn Error>> {
+        // In a real implementation, this would connect to the domain and extract SSL cert
+        // For demonstration, we'll simulate SSL data
+        
+        // Simulate SSL certificate data
+        let ssl_info = SSLCertInfo {
+            subject: format!("CN={}", domain),
+            issuer: "CN=Example CA, O=Example Corporation, C=US".to_string(),
+            valid_from: Utc::now() - chrono::Duration::days(30),
+            valid_to: Utc::now() + chrono::Duration::days(335),
+            serial_number: "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF".to_string(),
+            fingerprint: "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33".to_string(),
+            alternative_names: vec![domain.to_string(), format!("www.{}", domain)],
+        };
+        
+        Ok(Some(ssl_info))
+    }
+    
+    async fn enumerate_subdomains(&self, domain: &str) -> Result<Vec<String>, Box<dyn Error>> {
+        // In a real implementation, this would use various subdomain enumeration techniques
+        // For demonstration, we'll simulate subdomain discovery
+        
+        // Generate some plausible subdomains
+        let common_subdomains = vec![
+            "www", "mail", "remote", "blog", "webmail", "server", 
+            "ns1", "ns2", "cpanel", "ftp", "direct", "direct1", 
+            "direct2", "smtp", "shop", "api", "dev", "staging"
+        ];
+        
+        // Select a subset based on domain name length (deterministic but variable)
+        let subdomain_count = 3 + (domain.len() % 5);
+        let mut subdomains = Vec::new();
+        
+        for i in 0..subdomain_count {
+            let subdomain = format!("{}.{}", common_subdomains[i % common_subdomains.len()], domain);
+            subdomains.push(subdomain);
+        }
+        
+        Ok(subdomains)
+    }
+    
+    async fn collect_geospatial_intelligence(&self, target: &str) -> Result<GeospatialResults, Box<dyn Error>> {
+        info!("Collecting geospatial intelligence for: {}", target);
+        
+        let mut results = GeospatialResults {
+            locations_found: 0,
+            locations: Vec::new(),
+        };
+        
+        // In a real implementation, this would:
+        // 1. Extract location data from social media profiles
+        // 2. Find location mentions in content
+        // 3. Look up IP geolocation
+        // 4. Analyze image EXIF data
+        
+        // For demonstration, we'll simulate some location findings
+        
+        // Simulate a home location from social media profiles
+        results.locations.push(GeoLocation {
+            source: "Social Media Profile".to_string(),
+            location_type: "Home City".to_string(),
+            latitude: 40.7128,
+            longitude: -74.0060,
+            address: None,
+            city: Some("New York".to_string()),
+            country: Some("United States".to_string()),
+            timestamp: Some(Utc::now() - chrono::Duration::days(30)),
+            accuracy_meters: Some(5000.0),
+            confidence: 0.7,
+        });
+        
+        // Simulate a check-in or post location
+        results.locations.push(GeoLocation {
+            source: "Social Media Post".to_string(),
+            location_type: "Check-in".to_string(),
+            latitude: 40.7484,
+            longitude: -73.9857,
+            address: Some("Empire State Building, 350 5th Ave".to_string()),
+            city: Some("New York".to_string()),
+            country: Some("United States".to_string()),
+            timestamp: Some(Utc::now() - chrono::Duration::days(7)),
+            accuracy_meters: Some(10.0),
+            confidence: 0.85,
+        });
+        
+        // Simulate an IP geolocation
+        results.locations.push(GeoLocation {
+            source: "IP Geolocation".to_string(),
+            location_type: "Internet Access".to_string(),
+            latitude: 40.7306,
+            longitude: -73.9352,
+            address: None,
+            city: Some("New York".to_string()),
+            country: Some("United States".to_string()),
+            timestamp: Some(Utc::now() - chrono::Duration::hours(12)),
+            accuracy_meters: Some(1000.0),
+            confidence: 0.6,
+        });
+        
+        results.locations_found = results.locations.len() as u32;
+        
+        info!("Found {} locations for target: {}", results.locations_found, target);
+        
+        Ok(results)
+    }
+    
+    async fn analyze_relationships(&self, report: &mut IntelligenceReport) -> Result<(), Box<dyn Error>> {
+        info!("Analyzing relationships in collected data");
+        
+        let mut relationships = Vec::new();
+        
+        // Connect usernames to social profiles
+        if let Some(username_results) = &report.username_results {
+            if let Some(social_results) = &report.social_media_results {
+                for account in &username_results.accounts {
+                    for profile in &social_results.profiles {
+                        if account.platform == profile.platform && account.username == profile.username {
+                            relationships.push(Relationship {
+                                source_type: "UserAccount".to_string(),
+                                source_id: format!("{}:{}", account.platform, account.username),
+                                relationship_type: "IdentifiedAs".to_string(),
+                                target_type: "SocialProfile".to_string(),
+                                target_id: format!("{}:{}", profile.platform, profile.username),
+                                confidence: 0.95,
+                                metadata: HashMap::new(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Connect social profiles to locations
+        if let Some(social_results) = &report.social_media_results {
+            if let Some(geo_results) = &report.geospatial_results {
+                for profile in &social_results.profiles {
+                    if let Some(location) = &profile.location {
+                        for geo_location in &geo_results.locations {
+                            if let Some(city) = &geo_location.city {
+                                if location.contains(city) {
+                                    relationships.push(Relationship {
+                                        source_type: "SocialProfile".to_string(),
+                                        source_id: format!("{}:{}", profile.platform, profile.username),
+                                        relationship_type: "LocatedIn".to_string(),
+                                        target_type: "GeoLocation".to_string(),
+                                        target_id: format!("{}:{},{}", geo_location.source, geo_location.latitude, geo_location.longitude),
+                                        confidence: 0.7,
+                                        metadata: HashMap::new(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Connect domains to documents
+        if let Some(domain_results) = &report.domain_intelligence_results {
+            if let Some(document_results) = &report.document_metadata_results {
+                for domain in &domain_results.domains {
+                    for document in &document_results.documents {
+                        if document.url.contains(&domain.domain) {
+                            relationships.push(Relationship {
+                                source_type: "Domain".to_string(),
+                                source_id: domain.domain.clone(),
+                                relationship_type: "Hosts".to_string(),
+                                target_type: "Document".to_string(),
+                                target_id: document.url.clone(),
+                                confidence: 0.9,
+                                metadata: HashMap::new(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Add relationships to the report
+        report.relationships = relationships;
+        
+        info!("Identified {} relationships between collected data elements", report.relationships.len());
+        
+        Ok(())
+    }
+    
+    async fn calculate_confidence_scores(&self, report: &mut IntelligenceReport) -> Result<(), Box<dyn Error>> {
+        info!("Calculating confidence scores for intelligence findings");
+        
+        let mut confidence_scores = HashMap::new();
+        
+        // Calculate overall confidence for username discovery
+        if let Some(username_results) = &report.username_results {
+            let avg_confidence: f32 = if !username_results.accounts.is_empty() {
+                username_results.accounts.iter().map(|a| a.confidence).sum::<f32>() / username_results.accounts.len() as f32
+            } else {
+                0.0
+            };
+            
+            confidence_scores.insert("username_discovery".to_string(), avg_confidence);
+        }
+        
+        // Calculate overall confidence for social media profiles
+        if let Some(social_results) = &report.social_media_results {
+            let avg_confidence: f32 = if !social_results.profiles.is_empty() {
+                social_results.profiles.iter().map(|p| p.confidence).sum::<f32>() / social_results.profiles.len() as f32
+            } else {
+                0.0
+            };
+            
+            confidence_scores.insert("social_media_profiles".to_string(), avg_confidence);
+        }
+        
+        // Calculate overall confidence for dark web findings
+        if let Some(dark_web_results) = &report.dark_web_results {
+            let avg_confidence: f32 = if !dark_web_results.leaks.is_empty() {
+                dark_web_results.leaks.iter().map(|l| l.confidence).sum::<f32>() / dark_web_results.leaks.len() as f32
+            } else {
+                0.0
+            };
+            
+            confidence_scores.insert("dark_web_leaks".to_string(), avg_confidence);
+        }
+        
+        // Calculate overall confidence for domain intelligence
+        if let Some(domain_results) = &report.domain_intelligence_results {
+            let avg_confidence: f32 = if !domain_results.domains.is_empty() {
+                domain_results.domains.iter().map(|d| d.confidence).sum::<f32>() / domain_results.domains.len() as f32
+            } else {
+                0.0
+            };
+            
+            confidence_scores.insert("domain_intelligence".to_string(), avg_confidence);
+        }
+        
+        // Add other module confidence scores...
+        
+        // Calculate overall confidence score
+        let overall_confidence: f32 = if !confidence_scores.is_empty() {
+            confidence_scores.values().sum::<f32>() / confidence_scores.len() as f32
+        } else {
+            0.0
+        };
+        
+        confidence_scores.insert("overall".to_string(), overall_confidence);
+        
+        // Add confidence scores to the report
+        report.confidence_scores = confidence_scores;
+        
+        info!("Calculated confidence scores with overall confidence: {:.2}", 
+              report.confidence_scores.get("overall").unwrap_or(&0.0));
+        
+        Ok(())
+    }
+    
+    async fn generate_summary(&self, report: &mut IntelligenceReport) -> Result<(), Box<dyn Error>> {
+        info!("Generating summary and recommendations");
+        
+        let mut total_findings = 0;
+        let mut key_findings = Vec::new();
+        let mut recommendations = Vec::new();
+        
+        // Count total findings
+        if let Some(username_results) = &report.username_results {
+            total_findings += username_results.accounts_found;
+            
+            if username_results.accounts_found > 0 {
+                key_findings.push(format!("Found {} accounts across {} platforms", 
+                                         username_results.accounts_found, 
+                                         username_results.platforms_checked));
+            }
+        }
+        
+        if let Some(social_results) = &report.social_media_results {
+            total_findings += social_results.profiles_found;
+            
+            if social_results.profiles_found > 0 {
+                key_findings.push(format!("Identified {} social media profiles with {} notable posts", 
+                                         social_results.profiles_found,
+                                         social_results.notable_posts.len()));
+                                         
+                // Add recommendation for privacy settings if appropriate
+                recommendations.push("Review privacy settings on identified social media accounts".to_string());
+            }
+        }
+        
+        if let Some(dark_web_results) = &report.dark_web_results {
+            total_findings += dark_web_results.leaks_found;
+            
+            if dark_web_results.leaks_found > 0 {
+                key_findings.push(format!("Discovered {} data leaks containing credentials", 
+                                         dark_web_results.leaks_found));
+                                         
+                // Add recommendations for password security
+                recommendations.push("Change passwords for any accounts found in data breaches".to_string());
+                recommendations.push("Enable two-factor authentication on all accounts".to_string());
+            }
+        }
+        
+        if let Some(domain_results) = &report.domain_intelligence_results {
+            total_findings += domain_results.subdomains_found;
+            
+            if domain_results.subdomains_found > 0 {
+                key_findings.push(format!("Enumerated {} subdomains", domain_results.subdomains_found));
+                
+                // Add recommendation for subdomain security
+                recommendations.push("Review security of all identified subdomains".to_string());
+            }
+        }
+        
+        if let Some(document_results) = &report.document_metadata_results {
+            total_findings += document_results.documents_analyzed;
+            
+            if document_results.documents_analyzed > 0 {
+                key_findings.push(format!("Extracted metadata from {} documents", 
+                                         document_results.documents_analyzed));
+                                         
+                
+continue from here                                          document_results.documents_analyzed));
+
+Highlight
+rust
+
+Hide
+                                         document_results.documents_analyzed));
+                                         
+                // Add recommendation for document metadata
+                recommendations.push("Clean metadata from publicly accessible documents".to_string());
+            }
+        }
+        
+        if let Some(geo_results) = &report.geospatial_results {
+            total_findings += geo_results.locations_found;
+            
+            if geo_results.locations_found > 0 {
+                key_findings.push(format!("Identified {} geographic locations", 
+                                         geo_results.locations_found));
+                                         
+                // Add recommendation for location privacy
+                recommendations.push("Review location sharing settings on social media platforms".to_string());
+            }
+        }
+        
+        // Calculate risk score based on findings and confidence
+        let risk_score = self.calculate_risk_score(report);
+        
+        // Add general recommendations based on risk score
+        if risk_score > 0.7 {
+            recommendations.push("Conduct a comprehensive security audit".to_string());
+            recommendations.push("Consider using a privacy protection service".to_string());
+        } else if risk_score > 0.4 {
+            recommendations.push("Regularly monitor for new information exposures".to_string());
+        }
+        
+        // Update report summary
+        report.summary = ReportSummary {
+            total_findings: total_findings as u32,
+            risk_score,
+            key_findings,
+            recommendations,
+        };
+        
+        info!("Generated summary with {} key findings and {} recommendations", 
+              report.summary.key_findings.len(), report.summary.recommendations.len());
+        
+        Ok(())
+    }
+    
+    fn calculate_risk_score(&self, report: &IntelligenceReport) -> f32 {
+        let mut risk_factors = Vec::new();
+        
+        // Add risk factor for exposed accounts
+        if let Some(username_results) = &report.username_results {
+            risk_factors.push(0.1 * (username_results.accounts_found as f32).min(10.0) / 10.0);
+        }
+        
+        // Add risk factor for dark web leaks
+        if let Some(dark_web_results) = &report.dark_web_results {
+            risk_factors.push(0.3 * (dark_web_results.leaks_found as f32).min(5.0) / 5.0);
+        }
+        
+        // Add risk factor for exposed documents
+        if let Some(document_results) = &report.document_metadata_results {
+            risk_factors.push(0.15 * (document_results.documents_analyzed as f32).min(10.0) / 10.0);
+        }
+        
+        // Add risk factor for exposed locations
+        if let Some(geo_results) = &report.geospatial_results {
+            risk_factors.push(0.1 * (geo_results.locations_found as f32).min(5.0) / 5.0);
+        }
+        
+        // Add risk factor for social media exposure
+        if let Some(social_results) = &report.social_media_results {
+            risk_factors.push(0.2 * (social_results.profiles_found as f32).min(5.0) / 5.0);
+            risk_factors.push(0.15 * (social_results.notable_posts.len() as f32).min(10.0) / 10.0);
+        }
+        
+        // Calculate overall risk score
+        if risk_factors.is_empty() {
+            return 0.0;
+        }
+        
+        risk_factors.iter().sum::<f32>() / risk_factors.len() as f32
+    }
+    
+    async fn generate_report(&self, intelligence_report: &IntelligenceReport, format: &str) -> Result<String, Box<dyn Error>> {
+        match format.to_lowercase().as_str() {
+            "json" => {
+                Ok(serde_json::to_string_pretty(intelligence_report)?)
+            },
+            "html" => {
+                self.generate_html_report(intelligence_report).await
+            },
+            "txt" => {
+                self.generate_text_report(intelligence_report).await
+            },
+            _ => {
+                Err("Unsupported report format".into())
+            }
+        }
+    }
+    
+    async fn generate_html_report(&self, report: &IntelligenceReport) -> Result<String, Box<dyn Error>> {
+        // In a real implementation, this would use a template engine
+        // For demonstration, we'll create a simple HTML report
+        
+        let mut html = String::new();
+        
+        // HTML header
+        html.push_str("<!DOCTYPE html>\n<html>\n<head>\n");
+        html.push_str("<meta charset=\"UTF-8\">\n");
+        html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n");
+        html.push_str("<title>OmniSINT Intelligence Report</title>\n");
+        html.push_str("<style>\n");
+        html.push_str("body { font-family: Arial, sans-serif; margin: 0; padding: 20px; color: #333; }\n");
+        html.push_str("h1, h2, h3 { color: #2c3e50; }\n");
+        html.push_str("h1 { border-bottom: 2px solid #3498db; padding-bottom: 10px; }\n");
+        html.push_str(".section { margin: 20px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; }\n");
+        html.push_str(".summary { background-color: #f8f9fa; }\n");
+        html.push_str(".findings { background-color: #e8f4f8; }\n");
+        html.push_str(".risk-high { color: #c0392b; }\n");
+        html.push_str(".risk-medium { color: #e67e22; }\n");
+        html.push_str(".risk-low { color: #27ae60; }\n");
+        html.push_str("table { width: 100%; border-collapse: collapse; margin: 15px 0; }\n");
+        html.push_str("th, td { padding: 8px; text-align: left; border: 1px solid #ddd; }\n");
+        html.push_str("th { background-color: #f2f2f2; }\n");
+        html.push_str("</style>\n");
+        html.push_str("</head>\n<body>\n");
+        
+        // Report header
+        html.push_str(&format!("<h1>OmniSINT Intelligence Report: {}</h1>\n", report.metadata.target));
+        html.push_str(&format!("<p>Generated on: {}</p>\n", report.metadata.timestamp.format("%Y-%m-%d %H:%M:%S UTC")));
+        html.push_str(&format!("<p>Execution time: {:.2?}</p>\n", report.metadata.execution_time));
+        
+        // Summary section
+        html.push_str("<div class=\"section summary\">\n");
+        html.push_str("<h2>Summary</h2>\n");
+        
+        let risk_class = if report.summary.risk_score > 0.7 {
+            "risk-high"
+        } else if report.summary.risk_score > 0.4 {
+            "risk-medium"
+        } else {
+            "risk-low"
+        };
+        
+        html.push_str(&format!("<p>Total findings: {}</p>\n", report.summary.total_findings));
+        html.push_str(&format!("<p>Risk score: <span class=\"{}\"> {:.2}</span></p>\n", 
+                             risk_class, report.summary.risk_score));
+        
+        // Key findings
+        html.push_str("<h3>Key Findings</h3>\n");
+        html.push_str("<ul>\n");
+        for finding in &report.summary.key_findings {
+            html.push_str(&format!("<li>{}</li>\n", finding));
+        }
+        html.push_str("</ul>\n");
+        
+        // Recommendations
+        html.push_str("<h3>Recommendations</h3>\n");
+        html.push_str("<ul>\n");
+        for recommendation in &report.summary.recommendations {
+            html.push_str(&format!("<li>{}</li>\n", recommendation));
+        }
+        html.push_str("</ul>\n");
+        html.push_str("</div>\n"); // End summary section
+        
+        // Username results section
+        if let Some(username_results) = &report.username_results {
+            html.push_str("<div class=\"section findings\">\n");
+            html.push_str("<h2>Username Discovery Results</h2>\n");
+            html.push_str(&format!("<p>Platforms checked: {}</p>\n", username_results.platforms_checked));
+            html.push_str(&format!("<p>Accounts found: {}</p>\n", username_results.accounts_found));
+            
+            if !username_results.accounts.is_empty() {
+                html.push_str("<table>\n");
+                html.push_str("<tr><th>Platform</th><th>Username</th><th>URL</th><th>Confidence</th></tr>\n");
+                
+                for account in &username_results.accounts {
+                    html.push_str(&format!("<tr><td>{}</td><td>{}</td><td><a href=\"{}\" target=\"_blank\">{}</a></td><td>{:.2}</td></tr>\n", 
+                                         account.platform, account.username, account.url, account.url, account.confidence));
+                }
+                
+                html.push_str("</table>\n");
+            }
+            
+            html.push_str("</div>\n"); // End username section
+        }
+        
+        // Social media results section
+        if let Some(social_results) = &report.social_media_results {
+            html.push_str("<div class=\"section findings\">\n");
+            html.push_str("<h2>Social Media Results</h2>\n");
+            html.push_str(&format!("<p>Platforms analyzed: {}</p>\n", social_results.platforms_analyzed.join(", ")));
+            html.push_str(&format!("<p>Profiles found: {}</p>\n", social_results.profiles_found));
+            html.push_str(&format!("<p>Posts analyzed: {}</p>\n", social_results.posts_analyzed));
+            
+            if !social_results.profiles.is_empty() {
+                html.push_str("<h3>Profiles</h3>\n");
+                html.push_str("<table>\n");
+                html.push_str("<tr><th>Platform</th><th>Username</th><th>Display Name</th><th>Location</th><th>Followers</th><th>URL</th></tr>\n");
+                
+                for profile in &social_results.profiles {
+                    html.push_str(&format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"{}\" target=\"_blank\">Profile</a></td></tr>\n", 
+                                         profile.platform, 
+                                         profile.username, 
+                                         profile.display_name, 
+                                         profile.location.as_deref().unwrap_or("Unknown"), 
+                                         profile.followers.unwrap_or(0), 
+                                         profile.url));
+                }
+                
+                html.push_str("</table>\n");
+            }
+            
+            if !social_results.notable_posts.is_empty() {
+                html.push_str("<h3>Notable Posts</h3>\n");
+                html.push_str("<table>\n");
+                html.push_str("<tr><th>Platform</th><th>Date</th><th>Content</th><th>URL</th></tr>\n");
+                
+                for post in &social_results.notable_posts {
+                    html.push_str(&format!("<tr><td>{}</td><td>{}</td><td>{}</td><td><a href=\"{}\" target=\"_blank\">View</a></td></tr>\n", 
+                                         post.platform, 
+                                         post.timestamp.format("%Y-%m-%d"), 
+                                         post.content, 
+                                         post.url));
+                }
+                
+                html.push_str("</table>\n");
+            }
+            
+            html.push_str("</div>\n"); // End social media section
+        }
+        
+        // Dark web results section
+        if let Some(dark_web_results) = &report.dark_web_results {
+            html.push_str("<div class=\"section findings\">\n");
+            html.push_str("<h2>Dark Web Results</h2>\n");
+            html.push_str(&format!("<p>Sources checked: {}</p>\n", dark_web_results.sources_checked));
+            html.push_str(&format!("<p>Leaks found: {}</p>\n", dark_web_results.leaks_found));
+            html.push_str(&format!("<p>Credentials found: {}</p>\n", dark_web_results.credentials_found));
+            
+            if !dark_web_results.leaks.is_empty() {
+                html.push_str("<table>\n");
+                html.push_str("<tr><th>Source</th><th>Date Discovered</th><th>Type</th><th>Data Snippet</th><th>Confidence</th></tr>\n");
+                
+                for leak in &dark_web_results.leaks {
+                    html.push_str(&format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.2}</td></tr>\n", 
+                                         leak.source, 
+                                         leak.date_discovered.format("%Y-%m-%d"), 
+                                         leak.leak_type, 
+                                         leak.data_snippet, 
+                                         leak.confidence));
+                }
+                
+                html.push_str("</table>\n");
+            }
+            
+            html.push_str("</div>\n"); // End dark web section
+        }
+        
+        // Domain intelligence section
+        if let Some(domain_results) = &report.domain_intelligence_results {
+            html.push_str("<div class=\"section findings\">\n");
+            html.push_str("<h2>Domain Intelligence Results</h2>\n");
+            html.push_str(&format!("<p>Domains analyzed: {}</p>\n", domain_results.domains_analyzed.join(", ")));
+            html.push_str(&format!("<p>Subdomains found: {}</p>\n", domain_results.subdomains_found));
+            
+            for domain in &domain_results.domains {
+                html.push_str(&format!("<h3>Domain: {}</h3>\n", domain.domain));
+                
+                html.push_str("<table>\n");
+                html.push_str("<tr><th>Property</th><th>Value</th></tr>\n");
+                html.push_str(&format!("<tr><td>Registrar</td><td>{}</td></tr>\n", domain.registrar.as_deref().unwrap_or("Unknown")));
+                
+                if let Some(creation_date) = domain.creation_date {
+                    html.push_str(&format!("<tr><td>Creation Date</td><td>{}</td></tr>\n", creation_date.format("%Y-%m-%d")));
+                }
+                
+                if let Some(expiration_date) = domain.expiration_date {
+                    html.push_str(&format!("<tr><td>Expiration Date</td><td>{}</td></tr>\n", expiration_date.format("%Y-%m-%d")));
+                }
+                
+                html.push_str(&format!("<tr><td>Name Servers</td><td>{}</td></tr>\n", domain.name_servers.join(", ")));
+                html.push_str(&format!("<tr><td>IP Addresses</td><td>{}</td></tr>\n", domain.ip_addresses.join(", ")));
+                html.push_str("</table>\n");
+                
+                if !domain.subdomains.is_empty() {
+                    html.push_str("<h4>Subdomains</h4>\n");
+                    html.push_str("<ul>\n");
+                    for subdomain in &domain.subdomains {
+                        html.push_str(&format!("<li>{}</li>\n", subdomain));
+                    }
+                    html.push_str("</ul>\n");
+                }
+            }
+            
+            html.push_str("</div>\n"); // End domain section
+        }
+        
+        // Document metadata section
+        if let Some(document_results) = &report.document_metadata_results {
+            html.push_str("<div class=\"section findings\">\n");
+            html.push_str("<h2>Document Metadata Results</h2>\n");
+            html.push_str(&format!("<p>Documents analyzed: {}</p>\n", document_results.documents_analyzed));
+            html.push_str(&format!("<p>File types: {}</p>\n", document_results.file_types.join(", ")));
+            
+            if !document_results.documents.is_empty() {
+                html.push_str("<table>\n");
+                html.push_str("<tr><th>Filename</th><th>Type</th><th>Size</th><th>Author</th><th>Creation Date</th><th>URL</th></tr>\n");
+                
+                for document in &document_results.documents {
+                    let creation_date = document.creation_date.map_or("Unknown".to_string(), |d| d.format("%Y-%m-%d").to_string());
+                    
+                    html.push_str(&format!("<tr><td>{}</td><td>{}</td><td>{} KB</td><td>{}</td><td>{}</td><td><a href=\"{}\" target=\"_blank\">View</a></td></tr>\n", 
+                                         document.filename, 
+                                         document.file_type, 
+                                         document.size_bytes / 1024, 
+                                         document.author.as_deref().unwrap_or("Unknown"), 
+                                         creation_date, 
+                                         document.url));
+                }
+                
+                html.push_str("</table>\n");
+            }
+            
+            html.push_str("</div>\n"); // End document section
+        }
+        
+        // Geospatial section
+        if let Some(geo_results) = &report.geospatial_results {
+            html.push_str("<div class=\"section findings\">\n");
+            html.push_str("<h2>Geospatial Results</h2>\n");
+            html.push_str(&format!("<p>Locations found: {}</p>\n", geo_results.locations_found));
+            
+            if !geo_results.locations.is_empty() {
+                html.push_str("<table>\n");
+                html.push_str("<tr><th>Source</th><th>Type</th><th>Location</th><th>Coordinates</th><th>Date</th><th>Confidence</th></tr>\n");
+                
+                for location in &geo_results.locations {
+                    let location_text = match (&location.city, &location.country) {
+                        (Some(city), Some(country)) => format!("{}, {}", city, country),
+                        (Some(city), None) => city.clone(),
+                        (None, Some(country)) => country.clone(),
+                        (None, None) => "Unknown".to_string(),
+                    };
+                    
+                    let date = location.timestamp.map_or("Unknown".to_string(), |d| d.format("%Y-%m-%d").to_string());
+                    
+                    html.push_str(&format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{:.4}, {:.4}</td><td>{}</td><td>{:.2}</td></tr>\n", 
+                                         location.source, 
+                                         location.location_type, 
+                                         location_text, 
+                                         location.latitude, 
+                                         location.longitude, 
+                                         date, 
+                                         location.confidence));
+                }
+                
+                html.push_str("</table>\n");
+                
+                // Add a map if visualization is enabled
+                if self.config.modules.geospatial.visualization_enabled {
+                    html.push_str("<h3>Location Map</h3>\n");
+                    html.push_str("<div id=\"map\" style=\"height: 400px; width: 100%;\"></div>\n");
+                    
+                    // Add map JavaScript
+                    html.push_str("<script>\n");
+                    html.push_str("function initMap() {\n");
+                    html.push_str("  var map = new google.maps.Map(document.getElementById('map'), {\n");
+                    html.push_str("    zoom: 10,\n");
+                    
+                    // Center on first location
+                    if let Some(first_location) = geo_results.locations.first() {
+                        html.push_str(&format!("    center: {{lat: {}, lng: {}}},\n", 
+                                             first_location.latitude, first_location.longitude));
+                    }
+                    
+                    html.push_str("    mapTypeId: 'terrain'\n");
+                    html.push_str("  });\n");
+                    
+                    // Add markers for each location
+                    for (i, location) in geo_results.locations.iter().enumerate() {
+                        html.push_str(&format!("  var marker{} = new google.maps.Marker({{\n", i));
+                        html.push_str(&format!("    position: {{lat: {}, lng: {}}},\n", 
+                                             location.latitude, location.longitude));
+                        html.push_str("    map: map,\n");
+                        html.push_str(&format!("    title: '{}'\n", location.source));
+                        html.push_str("  });\n");
+                    }
+                    
+                    html.push_str("}\n");
+                    html.push_str("</script>\n");
+                    html.push_str("<script async defer src=\"https://maps.googleapis.com/maps/api/js?key=YOUR_API_KEY&callback=initMap\"></script>\n");
+                }
+            }
+            
+            html.push_str("</div>\n"); // End geospatial section
+        }
+        
+        // Relationships section
+        if !report.relationships.is_empty() {
+            html.push_str("<div class=\"section findings\">\n");
+            html.push_str("<h2>Relationship Analysis</h2>\n");
+            
+            html.push_str("<table>\n");
+            html.push_str("<tr><th>Source</th><th>Relationship</th><th>Target</th><th>Confidence</th></tr>\n");
+            
+            for relationship in &report.relationships {
+                html.push_str(&format!("<tr><td>{} ({})</td><td>{}</td><td>{} ({})</td><td>{:.2}</td></tr>\n", 
+                                     relationship.source_id, 
+                                     relationship.source_type, 
+                                     relationship.relationship_type, 
+                                     relationship.target_id, 
+                                     relationship.target_type, 
+                                     relationship.confidence));
+            }
+            
+            html.push_str("</table>\n");
+            html.push_str("</div>\n"); // End relationships section
+        }
+        
+        // Confidence scores section
+        if !report.confidence_scores.is_empty() {
+            html.push_str("<div class=\"section findings\">\n");
+            html.push_str("<h2>Confidence Scores</h2>\n");
+            
+            html.push_str("<table>\n");
+            html.push_str("<tr><th>Category</th><th>Confidence</th></tr>\n");
+            
+            for (category, score) in &report.confidence_scores {
+                html.push_str(&format!("<tr><td>{}</td><td>{:.2}</td></tr>\n", 
+                                     category.replace("_", " "), 
+                                     score));
+            }
+            
+            html.push_str("</table>\n");
+            html.push_str("</div>\n"); // End confidence section
+        }
+        
+        // HTML footer
+        html.push_str("<div class=\"section\">\n");
+        html.push_str("<p><em>Generated by OmniSINT Collector v");
+        html.push_str(&report.metadata.version);
+        html.push_str("</em></p>\n");
+        html.push_str("</div>\n");
+        html.push_str("</body>\n</html>");
+        
+        Ok(html)
+    }
+    
+    async fn generate_text_report(&self, report: &IntelligenceReport) -> Result<String, Box<dyn Error>> {
+        let mut text = String::new();
+        
+        // Report header
+        text.push_str(&format!("OmniSINT Intelligence Report: {}\n", report.metadata.target));
+        text.push_str(&format!("Generated on: {}\n", report.metadata.timestamp.format("%Y-%m-%d %H:%M:%S UTC")));
+        text.push_str(&format!("Execution time: {:.2?}\n", report.metadata.execution_time));
+        text.push_str("\n");
+        
+        // Summary section
+        text.push_str("=== SUMMARY ===\n");
+        text.push_str(&format!("Total findings: {}\n", report.summary.total_findings));
+        text.push_str(&format!("Risk score: {:.2}\n", report.summary.risk_score));
+        
+        text.push_str("\nKey Findings:\n");
+        for (i, finding) in report.summary.key_findings.iter().enumerate() {
+            text.push_str(&format!("{}. {}\n", i+1, finding));
+        }
+        
+        text.push_str("\nRecommendations:\n");
+        for (i, recommendation) in report.summary.recommendations.iter().enumerate() {
+            text.push_str(&format!("{}. {}\n", i+1, recommendation));
+        }
+        text.push_str("\n");
+        
+        // Detailed results sections for each module...
+        // This would be similar to the HTML report but formatted for plain text
+        
+        // For brevity, I'll just include one example section
+        if let Some(username_results) = &report.username_results {
+            text.push_str("=== USERNAME DISCOVERY RESULTS ===\n");
+            text.push_str(&format!("Platforms checked: {}\n", username_results.platforms_checked));
+            text.push_str(&format!("Accounts found: {}\n\n", username_results.accounts_found));
+            
+            if !username_results.accounts.is_empty() {
+                text.push_str("Accounts:\n");
+                
+                for account in &username_results.accounts {
+                    text.push_str(&format!("- Platform: {}\n", account.platform));
+                    text.push_str(&format!("  Username: {}\n", account.username));
+                    text.push_str(&format!("  URL: {}\n", account.url));
+                    text.push_str(&format!("  Confidence: {:.2}\n\n", account.confidence));
+                }
+            }
+        }
+        
+        // Footer
+        text.push_str(&format!("\nGenerated by OmniSINT Collector v{}\n", report.metadata.version));
+        
+        Ok(text)
+    }
+    
+    async fn save_report(&self, report_content: &str, format: &str, target: &str) -> Result<String, Box<dyn Error>> {
+        // Create output directory if it doesn't exist
+        let output_dir = Path::new(&self.config.output.directory);
+        if !output_dir.exists() {
+            fs::create_dir_all(output_dir)?;
+        }
+        
+        // Generate filename based on target and timestamp
+        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        let filename = format!("{}/{}_{}.{}", 
+                             self.config.output.directory,
+                             target.replace("@", "_at_").replace(".", "_"),
+                             timestamp,
+                             format);
+        
+        // Write report to file
+        let mut file = File::create(&filename)?;
+        file.write_all(report_content.as_bytes())?;
+        
+        info!("Report saved to {}", filename);
+        
+        Ok(filename)
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    // Initialize logger
+    env_logger::init();
+    
+    // Parse command-line arguments
+    let matches = App::new("OmniSINT Collector")
+        .version(env!("CARGO_PKG_VERSION"))
+        .author("Constanza")
+        .about("Comprehensive OSINT framework for gathering and analyzing information from diverse public sources")
+        .arg(Arg::with_name("config")
+            .short("c")
+            .long("config")
+            .value_name("FILE")
+            .help("Sets a custom config file")
+            .takes_value(true)
+            .default_value("config.json"))
+        .arg(Arg::with_name("output")
+            .short("o")
+            .long("output")
+            .value_name("FORMAT")
+            .help("Output format (json, html, txt)")
+            .takes_value(true)
+            .default_value("html"))
+        .subcommand(SubCommand::with_name("collect")
+            .about("Collect intelligence on a target")
+            .arg(Arg::with_name("target")
+                .help("Target to collect intelligence on (username, email, domain)")
+                .required(true)
+                .index(1))
+            .arg(Arg::with_name("type")
+                .help("Target type (username, email, domain)")
+                .required(true)
+                .index(2)))
+        .get_matches();
+    
+    // Load config file
+    let config_path = matches.value_of("config").unwrap();
+    
+    // Initialize collector
+    let collector = OmniSINTCollector::new(config_path).await?;
+    
+    // Process command
+    if let Some(collect_matches) = matches.subcommand_matches("collect") {
+        let target = collect_matches.value_of("target").unwrap();
+        let target_type = collect_matches.value_of("type").unwrap();
+        let output_format = matches.value_of("output").unwrap();
+        
+        info!("Starting intelligence collection for {} (type: {})", target, target_type);
+        
+        // Collect intelligence
+        let intelligence_report = collector.collect_intelligence(target, target_type).await?;
+        
+        // Generate report in requested format
+        let report_content = collector.generate_report(&intelligence_report, output_format).await?;
+        
+        // Save report to file
+        let report_file = collector.save_report(&report_content, output_format, target).await?;
+        
+        println!("Intelligence collection complete!");
+        println!("Report saved to: {}", report_file);
+    } else {
+        println!("No command specified. Use --help for usage information.");
+    }
+    
+    Ok(())
+}
